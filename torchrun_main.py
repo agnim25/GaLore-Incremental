@@ -26,7 +26,7 @@ from peft_pretraining.dataloader import PreprocessedIterableDataset
 from peft_pretraining.modeling_llama import LlamaForCausalLM
 
 import bitsandbytes as bnb
-from galore_torch import GaLoreAdamW, GaLoreAdamW8bit, GaLoreAdafactor
+from galore_torch import GaLoreAdamW, GaLoreAdamW8bit, GaLoreAdafactor, GaLoreAdamWInRank
 
 transformers.logging.set_verbosity_error()
 
@@ -70,6 +70,10 @@ def parse_args(args):
     parser.add_argument("--update_proj_gap", type=int, default=50)
     parser.add_argument("--galore_scale", type=float, default=1.0)
     parser.add_argument("--proj_type", type=str, default="std")
+
+
+    # incremental rank experiment flag, rank parameter ignored in this case
+    parser.add_argument("--incremental_rank", action="store_true")
     
     # disable ddp, single_gpu
     parser.add_argument("--single_gpu", default=False, action="store_true")
@@ -369,6 +373,11 @@ def main(args):
         
     else:
         raise ValueError(f"Optimizer {args.optimizer} not supported")
+
+    # for incremental rank test, call separate optimizer
+    if args.incremental_rank:
+        optimizer = GaLoreAdamWInRank(param_groups, lr=args.lr, weight_decay=args.weight_decay)
+
 
     if not layer_wise_flag:
         scheduler = training_utils.get_scheculer(
