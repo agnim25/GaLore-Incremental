@@ -6,6 +6,7 @@ from typing import Callable, Iterable, Tuple
 import torch
 from torch import nn
 from torch.optim import Optimizer
+import torch.nn.functional as F
 
 from transformers.utils.versions import require_version
 
@@ -63,10 +64,16 @@ class GaLoreAdamWInRank(Optimizer):
         defaults = {"lr": lr, "betas": betas, "eps": eps, "weight_decay": weight_decay, "correct_bias": correct_bias}
         super().__init__(params, defaults)
 
+        self.galore_group = None
         for group in self.param_groups:
             if "rank" in group:
-                group["param_rank"] = [2 for p in group["params"]]
-                
+                self.galore_group = group
+
+        if not self.galore_group:
+            raise ValueError("Did not provide galore params when initializing optimizer")
+
+        self.param_ranks = [2 for p in self.galore_group["params"]]
+        self.current_explained_ratios = [0 for p in self.galore_group["params"]]
         self.rank_buffer = 100
         self.explained_ratio_threshold = 0.9
         
@@ -86,7 +93,7 @@ class GaLoreAdamWInRank(Optimizer):
         # print current rank values
         # for group in self.param_groups:
         #     if "rank" in group:
-        #         print(group["param_rank"])
+        #         print(self.param_ranks)
 
         for group in self.param_groups:
             for i, p in enumerate(group["params"]):
@@ -106,18 +113,20 @@ class GaLoreAdamWInRank(Optimizer):
                     # InRank update
                     # prev: store a rank for each param (init 2), b = 100
                     # 1. compute top (r + b) singular vectors of grad
-                    curr_rank = group["param_rank"][i]
+                    curr_rank = self.param_ranks[i]
                     matrix = grad[:curr_rank + self.rank_buffer, :]
                     if matrix.dtype != torch.float:
                         matrix = matrix.float()
                     s = torch.linalg.svdvals(matrix)
+                    
                     # 2. increment rank until explained ratio >= threshold
                     while self.compute_explained_ratio(curr_rank, s) < self.explained_ratio_threshold:
                         curr_rank += 1
-                    group["param_rank"][i] = curr_rank
+                    self.current_explained_ratios[i] = self.compute_explained_ratio(curr_rank, s)
+                    self.param_ranks[i] = curr_rank
 
-                    if "projector" not in state:
-                        state["projector"] = GaLoreProjector(group["param_rank"][i], update_proj_gap=group["update_proj_gap"], scale=group["scale"], proj_type=group["proj_type"])
+                    if "projector" not in state or self.param_ranks[i] != state["projector"].rank:
+                        state["projector"] = GaLoreProjector(self.param_ranks[i], update_proj_gap=group["update_proj_gap"], scale=group["scale"], proj_type=group["proj_type"])
 
                     grad = state["projector"].project(grad, state["step"])
 
@@ -127,6 +136,14 @@ class GaLoreAdamWInRank(Optimizer):
                     state["exp_avg"] = torch.zeros_like(grad)
                     # Exponential moving average of squared gradient values
                     state["exp_avg_sq"] = torch.zeros_like(grad)
+                # if rank has increased, update state to match dimensions
+                elif "rank" in group:
+                    rank_dim = 0 if grad.size(dim=0) < grad.size(dim=1) else 1
+                    if self.param_ranks[i] > state["exp_avg"].size(dim=rank_dim):
+                        rank_diff = self.param_ranks[i] - state["exp_avg"].size(dim=rank_dim)
+                        update_shape = (0, 0, 0, rank_diff) if rank_dim == 0 else (0, rank_diff)
+                        state["exp_avg"] = F.pad(state["exp_avg"], update_shape, value=0)
+                        state["exp_avg_sq"] = F.pad(state["exp_avg_sq"], update_shape, value=0)
 
                 exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
                 beta1, beta2 = group["betas"]

@@ -267,6 +267,7 @@ def main(args):
     if 'galore' in args.optimizer.lower():
         # make parameters with "rank" to a single group, if param_name has "mlp" or "attn"
         galore_params = []
+        galore_modules = []
         target_modules_list = ["attn", "mlp"]
         for module_name, module in model.named_modules():
             if not isinstance(module, nn.Linear):
@@ -277,12 +278,13 @@ def main(args):
             
             print('enable GaLore for weights in module: ', module_name)
             galore_params.append(module.weight)
+            galore_modules.append(module_name)
         id_galore_params = [id(p) for p in galore_params]
         # make parameters without "rank" to another group
         regular_params = [p for p in model.parameters() if id(p) not in id_galore_params]
         # then call galore_adamw
         param_groups = [{'params': regular_params}, 
-                        {'params': galore_params, 'rank': args.rank, 'update_proj_gap': args.update_proj_gap, 'scale': args.galore_scale, 'proj_type': args.proj_type}]
+                        {'params': galore_params, 'rank': args.rank, 'update_proj_gap': args.update_proj_gap, 'scale': args.galore_scale, 'proj_type': args.proj_type, 'module_names': galore_modules}]
         
     # print params and trainable params
     logger.info(f"\n{model}\n")
@@ -406,6 +408,13 @@ def main(args):
     # we'll never go through all the data, so no need for epochs
     # ##############################
 
+    # choose layers for rank logging
+    if args.incremental_rank:
+        rank_idxs = list(range(0, 6))
+        for i in range(3):
+            rank_idxs += list(range(13 + i*7*2, 20 + i*7*2))
+
+
     for batch_idx, batch in enumerate(dataloader):
 
         global_step += 1
@@ -514,6 +523,14 @@ def main(args):
                 },
                 step=global_step,
             )
+
+            if args.incremental_rank:
+                for idx in rank_idxs:
+                    wandb.log({
+                        "rank_" + galore_modules[idx] : optimizer.param_ranks[idx],
+                        "explained_ratio_" + galore_modules[idx] : optimizer.current_explained_ratios[idx]
+                    },
+                    step=global_step)
         update_time = time.time()
 
     # ##############################
